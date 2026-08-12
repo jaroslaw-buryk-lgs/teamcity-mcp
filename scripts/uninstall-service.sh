@@ -5,6 +5,10 @@
 #   sudo ./scripts/uninstall-service.sh              # keep configuration
 #   sudo ./scripts/uninstall-service.sh --purge      # also remove /etc/teamcity-mcp
 
+# Re-exec under bash when invoked as `sh script.sh`: /bin/sh is dash here, which
+# has no `set -o pipefail` and would abort on the next line.
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
+
 set -euo pipefail
 
 SERVICE_NAME="teamcity-mcp"

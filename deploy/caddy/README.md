@@ -40,6 +40,24 @@ Then hand the root CA to each client:
 That prints the fingerprint plus per-platform trust instructions. Verify the
 fingerprint after transfer — it is what makes the copy tamper-evident.
 
+### Node clients need more than the system trust store
+
+Node does **not** read the OS trust store, so `update-ca-certificates` alone does
+not fix Claude Code or any other Node-based MCP client. It fails with
+`UNABLE_TO_GET_ISSUER_CERT_LOCALLY` until `NODE_EXTRA_CA_CERTS` points at the
+root. For Claude Code the durable place is `~/.claude/settings.json`, which
+applies to every session without touching a shell profile:
+
+```json
+{
+  "env": {
+    "NODE_EXTRA_CA_CERTS": "/absolute/path/to/caddy-root.crt"
+  }
+}
+```
+
+A shell `export` works too, but only for clients launched from that shell.
+
 ## Layout
 
 ```

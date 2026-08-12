@@ -12,6 +12,10 @@
 #
 # Clients must trust the exported root once - see scripts/export-ca.sh.
 
+# Re-exec under bash when invoked as `sh script.sh`: /bin/sh is dash here, which
+# has no `set -o pipefail` and would abort on the next line.
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
+
 set -euo pipefail
 
 CADDYFILE_DEST="/etc/caddy/Caddyfile"

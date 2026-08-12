@@ -8,6 +8,10 @@
 # One install per client machine covers every service behind this host's HTTPS
 # terminator, now and in future.
 
+# Re-exec under bash when invoked as `sh script.sh`: /bin/sh is dash here, which
+# has no `set -o pipefail` and would abort on the next line.
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
+
 set -euo pipefail
 
 CA_SRC="/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt"
@@ -42,16 +46,33 @@ Copy that file to each client machine and trust it. Verify the fingerprint above
 matches on arrival - it is what makes the transfer tamper-evident.
 
 --- Claude Code / any Node-based MCP client -------------------------------
-Trust it for that process only:
+IMPORTANT: Node does NOT consult the operating system trust store, so installing
+the root system-wide is not sufficient on its own. Without NODE_EXTRA_CA_CERTS the
+client fails with:
 
-    export NODE_EXTRA_CA_CERTS=/path/to/caddy-root.crt
+    UNABLE_TO_GET_ISSUER_CERT_LOCALLY: unable to get local issuer certificate
+
+For Claude Code specifically, the durable fix is settings.json, which applies to
+every session without touching a shell profile. In ~/.claude/settings.json:
+
+    {
+      "env": {
+        "NODE_EXTRA_CA_CERTS": "/absolute/path/to/caddy-root.crt"
+      }
+    }
+
+Or per-shell, which only affects clients launched from that shell:
+
+    export NODE_EXTRA_CA_CERTS=/absolute/path/to/caddy-root.crt
+
+Then register the server:
+
     claude mcp add --transport http teamcity https://$site/teamcity/mcp \\
       --header "X-TeamCity-Token: YOUR_TEAMCITY_TOKEN"
 
-To make it permanent, set NODE_EXTRA_CA_CERTS in your shell profile - the
-variable must be present in the environment that launches the client.
-
 --- Whole machine, Debian/Ubuntu ------------------------------------------
+Covers curl, git and other OpenSSL-based tools. Node still needs the variable above.
+
     sudo cp caddy-root.crt /usr/local/share/ca-certificates/caddy-root.crt
     sudo update-ca-certificates
 

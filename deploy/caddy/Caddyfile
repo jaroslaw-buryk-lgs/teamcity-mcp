@@ -60,10 +60,15 @@ spark-01.lgs-net.com {
 	import /etc/caddy/conf.d/*.caddy
 
 	# A bare visit to / gets a plain index rather than a confusing error.
+	# Entries are maintained by hand: services self-register their routing via
+	# conf.d, which the index cannot discover. Each line states its own
+	# authentication posture, because this is the first thing anyone sees and
+	# "served over HTTPS" says nothing about who may call it.
 	handle / {
 		respond "spark-01 services
 
-  /teamcity/   TeamCity MCP server
+  /teamcity/          TeamCity MCP server - requires your own TeamCity API token
+  /domain-knowledge/  Domain-knowledge RAG (Confluence + Fenice Jira) - no auth
 
 Other services register themselves via /etc/caddy/conf.d/.
 " 200
