@@ -65,3 +65,8 @@ testdata/output/
 # Anchored with a leading slash: a bare "server" also matched the
 # internal/server/ package directory, silently excluding new files there.
 /server
+
+# Exported by `make export-ca` for distribution to client machines. The CA root
+# is public, so this is not a secret - but it is generated output and is specific
+# to one host's Caddy instance, so it has no business being committed.
+/caddy-root.crt
