@@ -1,0 +1,78 @@
+# Caddy as a shared TLS terminator for services on this host.
+#
+# Installed to /etc/caddy/Caddyfile. Apply changes with:
+#   sudo caddy validate --config /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# Why this shape: the host has one DNS name and no way to add more (IT does not
+# issue records), and no publicly-trusted or corporate certificate is available.
+# So one hostname terminates TLS for every service, distinguished by path, using
+# a certificate from Caddy's own internal CA.
+{
+	# No ACME account is possible here: the name resolves only inside the network
+	# and the host has no inbound internet, so every public challenge type
+	# (HTTP-01, TLS-ALPN-01) is unreachable and DNS-01 would need credentials for
+	# the zone. Disable the automatic-HTTPS email prompt accordingly.
+	admin localhost:2019
+}
+
+spark-01.lgs-net.com {
+	# Caddy's built-in CA: it generates a root and intermediate, issues a leaf for
+	# this site, and rotates the leaf automatically. Nothing to renew by hand.
+	#
+	# Clients must trust the root once, exported from:
+	#   /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt
+	# That single install covers every service added below, now or later.
+	tls internal
+
+	encode zstd gzip
+
+	# --- teamcity-mcp ------------------------------------------------------
+	# handle_path strips the /teamcity prefix, so the backend still sees its own
+	# routes (/mcp, /healthz, ...) and needs no prefix awareness.
+	handle_path /teamcity/* {
+		reverse_proxy 127.0.0.1:8123 {
+			# MCP over HTTP is request/response, but the same endpoint also
+			# upgrades to WebSocket; Caddy proxies both without extra config.
+			#
+			# Build logs can be large and TeamCity can be slow, so allow more
+			# than the default for a streamed response.
+			transport http {
+				response_header_timeout 5m
+				read_timeout 5m
+			}
+		}
+	}
+
+	# --- add further services here ----------------------------------------
+	# handle_path /example/* {
+	#     reverse_proxy 127.0.0.1:9000
+	# }
+
+	# Anything else: a plain index so a bare visit is not a confusing 404.
+	handle {
+		respond "spark-01 services:
+  /teamcity/  TeamCity MCP server
+" 200
+	}
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+		# Caddy's JSON log includes request headers and redacts only Authorization
+		# and Cookie by default. Every request here carries the caller's TeamCity
+		# API token in X-TeamCity-Token, so it must be dropped explicitly or the
+		# access log becomes a file full of live credentials.
+		#
+		# The name is Go-canonicalized in logs: X-Teamcity-Token, not X-TeamCity-Token.
+		format filter {
+			wrap json
+			fields {
+				request>headers>X-Teamcity-Token delete
+				request>headers>Authorization delete
+			}
+		}
+	}
+}

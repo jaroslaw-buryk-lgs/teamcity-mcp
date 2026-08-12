@@ -112,12 +112,14 @@ The example config serves **plain HTTP**, so TeamCity tokens cross the network i
 cleartext. That is only acceptable on a network you fully trust. Two ways to fix
 it:
 
-- **Direct TLS** — set `TLS_CERT` and `TLS_KEY` (TLS 1.3). The service runs with
-  `ProtectHome=yes` and a dynamic user, so the files must live somewhere it can
-  read, such as `/etc/teamcity-mcp/tls/`, and be readable by it.
-- **Reverse proxy** — set `LISTEN_ADDR=127.0.0.1:8123` and let nginx or Caddy
-  terminate TLS. Caddy can obtain a real certificate automatically if the host
-  has a DNS name.
+- **Reverse proxy** (see [`deploy/caddy/`](../caddy/README.md)) — set
+  `LISTEN_ADDR=127.0.0.1:8123` and let Caddy terminate TLS. This is the setup
+  documented in this repo, and it is the right choice when the host runs more
+  than one service: one certificate, one open port, one CA for clients to trust.
+- **Direct TLS** — set `TLS_CERT` and `TLS_KEY` (TLS 1.3) and skip the proxy. The
+  service runs with `ProtectHome=yes` and a dynamic user, so the files must live
+  somewhere it can read, such as `/etc/teamcity-mcp/tls/`, and be readable by it.
+  Simpler for a single service, but you own certificate renewal.
 
 `SERVER_SECRET` is unset in the example, so anyone who can reach the port may use
 the service with their own TeamCity token. They gain no TeamCity access they did
