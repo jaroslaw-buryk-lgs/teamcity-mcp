@@ -61,20 +61,90 @@ https://spark-01.lgs-net.com/teamcity/mcp
 
 ## Adding a service
 
-Bind it to loopback, then add a block to `deploy/caddy/Caddyfile`:
+Services register their own routing by dropping a snippet into
+`/etc/caddy/conf.d/`. Nothing else on the host needs to edit this repo, and no
+other service's routing lives here.
 
 ```caddyfile
+# /etc/caddy/conf.d/grafana.caddy
 handle_path /grafana/* {
     reverse_proxy 127.0.0.1:3000
 }
 ```
 
 ```bash
-sudo ./scripts/install-caddy.sh    # reinstalls config, validates, reloads
+sudo -u caddy caddy validate --config /etc/caddy/Caddyfile   # see the warning below
+sudo systemctl reload caddy
 ```
 
-No new certificate, no client-side change — the existing trusted root already
-covers it.
+No new certificate and no client-side change — the trusted root already covers
+every path behind this terminator.
+
+### The contract for snippet files
+
+| | |
+|---|---|
+| **Location** | `/etc/caddy/conf.d/<service>.caddy` — the glob is `*.caddy`, so other extensions are ignored |
+| **Imported** | **inside** the `spark-01.lgs-net.com { … }` site block |
+| **Contents** | site-level directives only, normally one `handle_path` block. Do **not** open a site block or set global options — the import is already inside one |
+| **Ordering** | irrelevant. Caddy sorts `handle`/`handle_path` by path specificity, not file order, so the catch-all index below always stays last |
+| **Empty dir** | fine. Caddy only warns that the glob matched nothing |
+| **Ownership** | `scripts/install-caddy.sh` creates the directory and lists what it finds, but never writes to or removes anything inside it |
+
+Verify ordering after adding a path — a bare `/` should still print the index
+while the new prefix reaches its backend:
+
+```bash
+curl --cacert caddy-root.crt https://spark-01.lgs-net.com/          # index
+curl --cacert caddy-root.crt https://spark-01.lgs-net.com/grafana/  # backend
+```
+
+### Shared fate — the one real risk of a shared terminator
+
+`systemctl reload caddy` is safe: Caddy validates the new config first and keeps
+the running one if it fails. **Starting** is not. A malformed snippet means Caddy
+will not start at all, which takes down *every* service behind the terminator at
+the next boot or restart — not just the one whose snippet is broken.
+
+So always validate before reloading, and treat `/etc/caddy/conf.d/` as shared
+production config even though each file has a different owner.
+
+### TLS is not authentication
+
+Putting a path behind this terminator encrypts it in transit. It does **not**
+authenticate anyone. Each service remains responsible for its own access control,
+and the posture genuinely differs per path — for example `/teamcity/` requires the
+caller's own TeamCity token and grants exactly that user's permissions, whereas
+another path may be entirely unauthenticated by its owner's choice.
+
+Do not read "it's on HTTPS" as "it's secured". If you need a gate at this layer
+for a specific path, that is a per-path decision for that service's owner:
+
+```caddyfile
+handle_path /example/* {
+    @noauth not header Authorization "Bearer {env.EXAMPLE_TOKEN}"
+    respond @noauth 401
+    reverse_proxy 127.0.0.1:9000
+}
+```
+
+If any path adopts that, keep `Authorization` in the log-redaction list below.
+
+### Backends that validate the Host header
+
+Some MCP server frameworks — the Python MCP SDK among them — enforce
+DNS-rebinding protection by checking the `Host` header and answering
+**`421 Invalid Host header`** to anything not on their allowlist, independently of
+what address they bind. Caddy forwards the original Host, so such a backend sees
+`spark-01.lgs-net.com` (no port, since 443 is implied) and must accept exactly
+that value.
+
+The failure mode is misleading in two ways: it looks like the proxy is broken, and
+health endpoints typically **bypass** that middleware — so `/health` returns 200
+through the proxy while every real call returns 421. Never treat a passing health
+probe as evidence that a proxied path works; make a real call.
+
+This does not affect `teamcity-mcp`, which does not validate Host.
 
 ## Operating
 

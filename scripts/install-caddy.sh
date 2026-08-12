@@ -15,6 +15,7 @@
 set -euo pipefail
 
 CADDYFILE_DEST="/etc/caddy/Caddyfile"
+CONF_D="/etc/caddy/conf.d"
 LOG_DIR="/var/log/caddy"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CADDYFILE_SRC="$REPO_ROOT/deploy/caddy/Caddyfile"
@@ -81,6 +82,18 @@ fi
 
 site=$(grep -m1 -E '^[a-z0-9.-]+ \{' "$CADDYFILE_DEST" | awk '{print $1}')
 [ -n "$site" ] || die "could not determine the site name from $CADDYFILE_DEST"
+
+# Other services on this host register their own routing by dropping a snippet
+# here. This script creates the directory but NEVER writes to or removes
+# anything inside it - those files belong to other packages and owners.
+install -d -m 0755 -o root -g root "$CONF_D"
+snippets=$(find "$CONF_D" -maxdepth 1 -name '*.caddy' -type f 2>/dev/null | sort)
+if [ -n "$snippets" ]; then
+    ok "found $(echo "$snippets" | wc -l) foreign snippet(s) in $CONF_D:"
+    echo "$snippets" | sed 's|^|       |'
+else
+    ok "$CONF_D (empty - no other services registered)"
+fi
 
 # Validate as the caddy user so this check cannot create root-owned state.
 info "Validating configuration"

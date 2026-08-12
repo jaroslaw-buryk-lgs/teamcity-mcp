@@ -44,16 +44,40 @@ spark-01.lgs-net.com {
 		}
 	}
 
-	# --- add further services here ----------------------------------------
-	# handle_path /example/* {
-	#     reverse_proxy 127.0.0.1:9000
-	# }
+	# --- other services own their own routing ------------------------------
+	# Each service on this host drops a snippet into /etc/caddy/conf.d/ rather
+	# than editing this file, so no two owners contend over one config and no
+	# service's routing has to live in another service's repo.
+	#
+	# A snippet contains site-level directives only - typically one handle_path
+	# block - and must not open its own site block or set global options.
+	#
+	# Ordering does not depend on file order: Caddy sorts handle blocks by path
+	# specificity, so the unmatched fallback below always stays last.
+	#
+	# An empty or absent directory is fine; Caddy only warns that the glob
+	# matched nothing. See deploy/caddy/README.md for the full contract.
+	import /etc/caddy/conf.d/*.caddy
 
-	# Anything else: a plain index so a bare visit is not a confusing 404.
-	handle {
-		respond "spark-01 services:
-  /teamcity/  TeamCity MCP server
+	# A bare visit to / gets a plain index rather than a confusing error.
+	handle / {
+		respond "spark-01 services
+
+  /teamcity/   TeamCity MCP server
+
+Other services register themselves via /etc/caddy/conf.d/.
 " 200
+	}
+
+	# Everything else is a genuine 404.
+	#
+	# This must NOT be a catch-all 200: a client pointed at a mistyped path would
+	# then receive 200 with this index as the body, which reads as success and
+	# hides the mistake. Both of these stay last automatically - Caddy orders
+	# handle blocks by path specificity, not file order.
+	handle {
+		respond "404 - no service registered at this path. See / for the index.
+" 404
 	}
 
 	log {
