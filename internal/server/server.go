@@ -11,14 +11,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
-	"github.com/itcaat/teamcity-mcp/internal/cache"
 	"github.com/itcaat/teamcity-mcp/internal/config"
 	"github.com/itcaat/teamcity-mcp/internal/health"
 	"github.com/itcaat/teamcity-mcp/internal/mcp"
@@ -26,54 +26,58 @@ import (
 	"github.com/itcaat/teamcity-mcp/internal/teamcity"
 )
 
+// wsRequestTimeout bounds a single WebSocket message. Without it, a hijacked
+// connection has no cancellation path at all.
+const wsRequestTimeout = 5 * time.Minute
+
+// unauthenticatedPaths bypass the SERVER_SECRET gate. Matched exactly: a prefix
+// match would let /readyzzz through as well.
+var unauthenticatedPaths = []string{"/healthz", "/readyz", "/metrics"}
+
 // Server represents the MCP server
 type Server struct {
-	cfg      *config.Config
+	// cfg is swapped atomically so SIGHUP does not race in-flight requests.
+	cfg      atomic.Pointer[config.Config]
 	logger   *zap.SugaredLogger
-	tc       *teamcity.Client
-	cache    *cache.Cache
+	provider *teamcity.Provider
 	health   *health.Checker
 	mcp      *mcp.Handler
 	upgrader websocket.Upgrader
-	mu       sync.RWMutex
+
+	// baseCtx is the server lifecycle context, used to scope hijacked
+	// WebSocket connections. Set by startHTTP.
+	baseCtx context.Context
 }
 
 // New creates a new MCP server instance
 func New(cfg *config.Config, logger *zap.SugaredLogger) (*Server, error) {
-	// Create TeamCity client
-	tc, err := teamcity.NewClient(cfg.TeamCity, logger)
+	// One provider for the process. It mints a per-request client from the
+	// caller's own credentials over a single shared HTTP transport, so no
+	// process-wide TeamCity identity exists.
+	provider, err := teamcity.NewProvider(cfg.TeamCity, logger)
 	if err != nil {
-		return nil, fmt.Errorf("creating TeamCity client: %w", err)
+		return nil, fmt.Errorf("creating TeamCity provider: %w", err)
 	}
 
-	// Create cache
-	cache, err := cache.New(cfg.Cache)
-	if err != nil {
-		return nil, fmt.Errorf("creating cache: %w", err)
-	}
+	// The readiness probe is the only consumer of the operator's own credentials,
+	// and tolerates their absence.
+	probeClient, _ := provider.DefaultClient()
 
-	// Create health checker
-	health := health.New(tc, logger)
-
-	// Create MCP handler
-	mcpHandler := mcp.NewHandler(tc, cache, logger)
-
-	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return true // Configure properly for production
-		},
-	}
-
-	return &Server{
-		cfg:      cfg,
+	s := &Server{
 		logger:   logger,
-		tc:       tc,
-		cache:    cache,
-		health:   health,
-		mcp:      mcpHandler,
-		upgrader: upgrader,
-	}, nil
+		provider: provider,
+		health:   health.New(probeClient, logger),
+		mcp:      mcp.NewHandler(provider, logger),
+	}
+	s.cfg.Store(cfg)
+
+	s.upgrader = websocket.Upgrader{CheckOrigin: s.checkOrigin}
+
+	return s, nil
 }
+
+// config returns the current configuration snapshot.
+func (s *Server) config() *config.Config { return s.cfg.Load() }
 
 // Start starts the server with the specified transport
 func (s *Server) Start(ctx context.Context, transport string) error {
@@ -89,35 +93,39 @@ func (s *Server) Start(ctx context.Context, transport string) error {
 
 // startHTTP starts the HTTP server
 func (s *Server) startHTTP(ctx context.Context) error {
+	s.baseCtx = ctx
+	cfg := s.config()
+
 	mux := http.NewServeMux()
 
-	// MCP endpoint
-	mux.HandleFunc("/mcp", s.handleMCP)
+	// MCP endpoint - the only route that accepts per-request TeamCity credentials.
+	mux.Handle("/mcp", s.credentialsMiddleware(http.HandlerFunc(s.handleMCP)))
 
-	// Health endpoints
+	// Health and metrics endpoints are registered OUTSIDE credentialsMiddleware.
+	// They are unauthenticated, so they must be structurally incapable of acting
+	// on a client-supplied TeamCity URL.
 	mux.HandleFunc("/healthz", s.health.LivenessHandler)
 	mux.HandleFunc("/readyz", s.health.ReadinessHandler)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	server := &http.Server{
-		Addr:    s.cfg.Server.ListenAddr,
+		Addr:    cfg.Server.ListenAddr,
 		Handler: s.authMiddleware(mux),
 	}
 
 	// Configure TLS if certificates are provided
-	if s.cfg.Server.TLSCert != "" && s.cfg.Server.TLSKey != "" {
-		tlsConfig := &tls.Config{
+	if cfg.Server.TLSCert != "" && cfg.Server.TLSKey != "" {
+		server.TLSConfig = &tls.Config{
 			MinVersion: tls.VersionTLS13,
 		}
-		server.TLSConfig = tlsConfig
 	}
 
 	// Start server in goroutine
 	errChan := make(chan error, 1)
 	go func() {
-		s.logger.Info("Starting HTTP server", "addr", s.cfg.Server.ListenAddr)
-		if s.cfg.Server.TLSCert != "" && s.cfg.Server.TLSKey != "" {
-			errChan <- server.ListenAndServeTLS(s.cfg.Server.TLSCert, s.cfg.Server.TLSKey)
+		s.logger.Info("Starting HTTP server", "addr", cfg.Server.ListenAddr)
+		if cfg.Server.TLSCert != "" && cfg.Server.TLSKey != "" {
+			errChan <- server.ListenAndServeTLS(cfg.Server.TLSCert, cfg.Server.TLSKey)
 		} else {
 			errChan <- server.ListenAndServe()
 		}
@@ -135,9 +143,19 @@ func (s *Server) startHTTP(ctx context.Context) error {
 	}
 }
 
-// startSTDIO starts the STDIO transport
+// startSTDIO starts the STDIO transport.
+//
+// stdio has no headers, so the operator's TC_URL/TC_TOKEN are bound into the
+// context once for the lifetime of the process. This keeps stdio on exactly the
+// same handler code path as the multi-tenant HTTP transport.
 func (s *Server) startSTDIO(ctx context.Context) error {
 	s.logger.Info("Starting STDIO transport")
+
+	creds, ok := s.provider.Policy().ServerCredentials()
+	if !ok {
+		return fmt.Errorf("the stdio transport requires TC_URL and TC_TOKEN to be set")
+	}
+	ctx = teamcity.WithCredentials(ctx, creds)
 
 	decoder := json.NewDecoder(os.Stdin)
 	encoder := json.NewEncoder(os.Stdout)
@@ -203,8 +221,13 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleWebSocket handles WebSocket connections
+// handleWebSocket handles WebSocket connections.
+//
+// Headers exist only at upgrade time, so credentials are captured before the
+// upgrade and bound to the connection for its whole lifetime.
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	creds, hasCreds := teamcity.CredentialsFromContext(r.Context())
+
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.logger.Error("Failed to upgrade to WebSocket", "error", err)
@@ -212,10 +235,19 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	// Derive from the server lifecycle context, NOT r.Context(): once Upgrade has
+	// hijacked the connection, net/http no longer cancels the request context, so
+	// r.Context() would never fire - neither on client disconnect nor on shutdown.
+	connCtx, cancel := context.WithCancel(s.baseContext())
+	defer cancel()
+	if hasCreds {
+		connCtx = teamcity.WithCredentials(connCtx, creds)
+	}
+
 	metrics.ServerConnections.WithLabelValues("websocket").Inc()
 	defer metrics.ServerConnections.WithLabelValues("websocket").Dec()
 
-	s.logger.Info("WebSocket connection established")
+	s.logger.Info("WebSocket connection established", "tenant", creds.Fingerprint())
 
 	for {
 		var req json.RawMessage
@@ -226,7 +258,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		resp, err := s.mcp.HandleRequest(r.Context(), req)
+		reqCtx, reqCancel := context.WithTimeout(connCtx, wsRequestTimeout)
+		resp, err := s.mcp.HandleRequest(reqCtx, req)
+		reqCancel()
+
 		if err != nil {
 			s.logger.Error("Failed to handle WebSocket request", "error", err)
 			continue
@@ -241,6 +276,35 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// baseContext returns the server lifecycle context, falling back to Background
+// when the server was constructed without going through startHTTP (tests).
+func (s *Server) baseContext() context.Context {
+	if s.baseCtx != nil {
+		return s.baseCtx
+	}
+	return context.Background()
+}
+
+// checkOrigin gates WebSocket upgrades.
+//
+// Non-browser clients send no Origin and are always allowed. A browser cannot
+// set X-TeamCity-Token on a WebSocket, so a malicious page has no credentials -
+// but it could still drive the server if server-token fallback were enabled,
+// which is why that fallback is off by default.
+func (s *Server) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	allowed := s.config().Server.AllowedOrigins
+	if len(allowed) == 0 {
+		s.logger.Warn("Rejected WebSocket upgrade with an Origin header; set ALLOWED_ORIGINS to permit browser clients",
+			"origin", origin)
+		return false
+	}
+	return slices.Contains(allowed, origin)
+}
+
 // handleMetrics handles Prometheus metrics endpoint
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	// This will be implemented by importing prometheus handler
@@ -248,17 +312,48 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("# Metrics endpoint placeholder\n"))
 }
 
-// authMiddleware provides HMAC-based authentication (optional)
+// credentialsMiddleware extracts the caller's TeamCity credentials from request
+// headers and puts them in the request context.
+//
+// It deliberately does NOT reject a request that carries no token: initialize,
+// tools/list, ping and get_current_time must work without credentials so a
+// client can connect and discover tools. Only the MCP handler knows whether a
+// given method needs TeamCity, and it answers with an actionable JSON-RPC error.
+//
+// A disallowed URL is different - that is rejected here with 400 so an SSRF
+// probe never reaches the handler, and so a client cannot silently be served a
+// different TeamCity than the one it asked for.
+func (s *Server) credentialsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		creds, err := s.provider.CredentialsFromRequest(r)
+		if err != nil {
+			s.logger.Warn("Rejected request with a disallowed TeamCity URL", "error", err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if !creds.IsZero() {
+			r = r.WithContext(teamcity.WithCredentials(r.Context(), creds))
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// authMiddleware provides the optional outer HMAC gate (SERVER_SECRET).
+// This is separate from TeamCity credentials: a 401 here always means the
+// server secret was wrong, never that a TeamCity token was missing.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip auth for health endpoints
-		if strings.HasPrefix(r.URL.Path, "/health") || strings.HasPrefix(r.URL.Path, "/ready") || strings.HasPrefix(r.URL.Path, "/metrics") {
+		// Skip auth for health and metrics endpoints (exact match).
+		if slices.Contains(unauthenticatedPaths, r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		// If no server secret is configured, skip authentication
-		if s.cfg.Server.ServerSecret == "" {
+		secret := s.config().Server.ServerSecret
+		if secret == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -275,7 +370,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		}
 
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if !s.validateToken(token) {
+		if !validateToken(secret, token) {
 			http.Error(w, "Invalid token", http.StatusUnauthorized)
 			return
 		}
@@ -285,20 +380,27 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 }
 
 // validateToken validates the HMAC token
-func (s *Server) validateToken(token string) bool {
+func validateToken(secret, token string) bool {
 	// Simple HMAC validation - in production, implement proper token validation
-	mac := hmac.New(sha256.New, []byte(s.cfg.Server.ServerSecret))
+	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte("teamcity-mcp"))
-	expectedMAC := mac.Sum(nil)
-	expectedToken := hex.EncodeToString(expectedMAC)
+	expectedToken := hex.EncodeToString(mac.Sum(nil))
 
 	return hmac.Equal([]byte(token), []byte(expectedToken))
 }
 
-// UpdateConfig updates the server configuration (for SIGHUP)
+// UpdateConfig updates the server configuration (for SIGHUP).
+//
+// The TeamCity policy is rebuilt so a changed TC_URL/TC_ALLOWED_URLS actually
+// takes effect - previously the reload silently did nothing for TeamCity.
 func (s *Server) UpdateConfig(cfg *config.Config) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cfg = cfg
+	policy, err := teamcity.NewPolicy(cfg.TeamCity)
+	if err != nil {
+		s.logger.Error("Ignoring configuration reload: invalid TeamCity settings", "error", err)
+		return
+	}
+
+	s.cfg.Store(cfg)
+	s.provider.SetPolicy(policy)
 	s.logger.Info("Configuration updated")
 }

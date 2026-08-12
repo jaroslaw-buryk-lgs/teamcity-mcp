@@ -3,29 +3,72 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"go.uber.org/zap"
 
-	"github.com/itcaat/teamcity-mcp/internal/cache"
 	"github.com/itcaat/teamcity-mcp/internal/metrics"
 	"github.com/itcaat/teamcity-mcp/internal/teamcity"
 )
 
+// JSON-RPC error codes in the implementation-defined range (-32000..-32099).
+//
+// Deliberately not -32603 (which reads as a server bug and prompts clients to
+// retry) and not -32602 (the params were fine; the transport headers were not).
+const (
+	CodeCredentialsRequired = -32001
+	CodeURLNotAllowed       = -32002
+)
+
+// credsHelp is returned verbatim as the JSON-RPC error message. The whole
+// instruction has to be in `message`, because several MCP clients surface only
+// that field.
+const credsHelp = "TeamCity credentials required. Send the HTTP header " +
+	"'" + teamcity.HeaderToken + ": <your TeamCity API token>' with each request. " +
+	"(On the stdio transport, set the TC_URL and TC_TOKEN environment variables instead.)"
+
+// ClientResolver produces a TeamCity client for a request. It is satisfied by
+// *teamcity.Provider (multi-tenant HTTP) and by *teamcity.Client itself
+// (single-tenant stdio and tests).
+type ClientResolver interface {
+	ClientForContext(ctx context.Context) (*teamcity.Client, error)
+}
+
 // Handler handles MCP protocol messages
 type Handler struct {
-	tc     *teamcity.Client
-	cache  *cache.Cache
-	logger *zap.SugaredLogger
+	clients ClientResolver
+	logger  *zap.SugaredLogger
 }
 
 // NewHandler creates a new MCP handler
-func NewHandler(tc *teamcity.Client, cache *cache.Cache, logger *zap.SugaredLogger) *Handler {
+func NewHandler(clients ClientResolver, logger *zap.SugaredLogger) *Handler {
 	return &Handler{
-		tc:     tc,
-		cache:  cache,
-		logger: logger,
+		clients: clients,
+		logger:  logger,
+	}
+}
+
+// client resolves the TeamCity client for this request.
+func (h *Handler) client(ctx context.Context) (*teamcity.Client, error) {
+	return h.clients.ClientForContext(ctx)
+}
+
+// credentialError maps the credential sentinels onto actionable JSON-RPC errors.
+// Returns nil when err is not credential-related, so callers fall through to
+// their normal error handling.
+func (h *Handler) credentialError(id interface{}, err error) interface{} {
+	switch {
+	case errors.Is(err, teamcity.ErrNoCredentials):
+		return h.errorResponse(id, CodeCredentialsRequired, credsHelp, map[string]interface{}{
+			"tokenHeader": teamcity.HeaderToken,
+			"urlHeader":   teamcity.HeaderURL,
+		})
+	case errors.Is(err, teamcity.ErrURLNotAllowed):
+		return h.errorResponse(id, CodeURLNotAllowed, err.Error(), nil)
+	default:
+		return nil
 	}
 }
 
@@ -50,39 +93,56 @@ func (h *Handler) HandleRequest(ctx context.Context, req json.RawMessage) (inter
 		return h.errorResponse(baseReq.ID, -32600, "Invalid Request", nil), nil
 	}
 
-	// Record metrics
-	defer func() {
-		duration := time.Since(start).Seconds()
-		metrics.RecordMCPRequest(baseReq.Method, "success", duration)
-	}()
+	resp, err := h.route(ctx, baseReq.Method, baseReq.ID, baseReq.Params)
 
-	// Route to appropriate handler
-	switch baseReq.Method {
+	// Record metrics. The status has to be derived from the response, not
+	// hardcoded, or credential and tool failures are invisible in metrics.
+	metrics.RecordMCPRequest(baseReq.Method, responseStatus(resp, err), time.Since(start).Seconds())
+
+	return resp, err
+}
+
+// responseStatus classifies a handled request for the metrics status label.
+func responseStatus(resp interface{}, err error) string {
+	if err != nil {
+		return "error"
+	}
+	if m, ok := resp.(map[string]interface{}); ok {
+		if _, isErr := m["error"]; isErr {
+			return "error"
+		}
+	}
+	return "success"
+}
+
+// route dispatches a parsed JSON-RPC request to the appropriate handler.
+func (h *Handler) route(ctx context.Context, method string, id interface{}, params json.RawMessage) (interface{}, error) {
+	switch method {
 	case "initialize":
-		return h.handleInitialize(baseReq.ID, baseReq.Params)
+		return h.handleInitialize(id, params)
 	case "initialized":
-		return h.handleInitialized(baseReq.ID)
+		return h.handleInitialized(id)
 	case "notifications/initialized":
-		return h.handleInitialized(baseReq.ID)
+		return h.handleInitialized(id)
 	case "notifications/cancelled":
 		// Handle cancellation notifications - just log and return nil (no response for notifications)
 		h.logger.Debug("Received cancellation notification")
 		return nil, nil
 	case "resources/list":
-		return h.handleResourcesList(ctx, baseReq.ID, baseReq.Params)
+		return h.handleResourcesList(ctx, id, params)
 	case "resources/read":
-		return h.handleResourcesRead(ctx, baseReq.ID, baseReq.Params)
+		return h.handleResourcesRead(ctx, id, params)
 	case "tools/list":
-		return h.handleToolsList(baseReq.ID)
+		return h.handleToolsList(id)
 	case "tools/call":
-		return h.handleToolsCall(ctx, baseReq.ID, baseReq.Params)
+		return h.handleToolsCall(ctx, id, params)
 	case "ping":
-		return h.handlePing(baseReq.ID)
+		return h.handlePing(id)
 	default:
-		h.logger.Warn("Unknown method called", "method", baseReq.Method, "id", baseReq.ID)
+		h.logger.Warn("Unknown method called", "method", method, "id", id)
 		// Only return an error response if this is a request (has an ID), not a notification
-		if baseReq.ID != nil {
-			return h.errorResponse(baseReq.ID, -32601, "Method not found", nil), nil
+		if id != nil {
+			return h.errorResponse(id, -32601, "Method not found", nil), nil
 		}
 		// For notifications, just return nil (no response)
 		return nil, nil
@@ -133,6 +193,9 @@ func (h *Handler) handleResourcesList(ctx context.Context, id interface{}, param
 
 	resources, err := h.listResources(ctx, req.URI)
 	if err != nil {
+		if credErr := h.credentialError(id, err); credErr != nil {
+			return credErr, nil
+		}
 		return h.errorResponse(id, -32603, "Internal error", err.Error()), nil
 	}
 
@@ -153,6 +216,9 @@ func (h *Handler) handleResourcesRead(ctx context.Context, id interface{}, param
 
 	resource, err := h.readResource(ctx, req.URI)
 	if err != nil {
+		if credErr := h.credentialError(id, err); credErr != nil {
+			return credErr, nil
+		}
 		return h.errorResponse(id, -32603, "Internal error", err.Error()), nil
 	}
 
@@ -504,6 +570,13 @@ func (h *Handler) handleToolsCall(ctx context.Context, id interface{}, params js
 
 	result, err := h.callTool(ctx, req.Name, req.Arguments)
 	if err != nil {
+		// A missing or rejected token is a client configuration problem, so it
+		// gets its own actionable error rather than looking like a server fault.
+		if credErr := h.credentialError(id, err); credErr != nil {
+			h.logger.Info("Tool call rejected: TeamCity credentials unusable",
+				"tool", req.Name, "error", err.Error())
+			return credErr, nil
+		}
 		h.logger.Error("Tool execution failed", "tool", req.Name, "error", err.Error())
 		return h.errorResponse(id, -32603, "Tool execution failed", err.Error()), nil
 	}
@@ -587,18 +660,26 @@ func (h *Handler) listResources(ctx context.Context, uri string) ([]interface{},
 		}, nil
 	}
 
-	// When a specific URI is requested, fetch the actual data
+	// teamcity://runtime is served locally and needs no credentials.
+	if uri == "teamcity://runtime" {
+		return h.listRuntimeInfo(ctx)
+	}
+
+	// Everything below talks to TeamCity, so resolve credentials now.
+	tc, err := h.client(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	switch uri {
 	case "teamcity://projects":
-		return h.listProjects(ctx)
+		return tc.ListProjects(ctx)
 	case "teamcity://buildTypes":
-		return h.listBuildTypes(ctx)
+		return tc.ListBuildTypes(ctx)
 	case "teamcity://builds":
-		return h.listBuilds(ctx)
+		return tc.ListBuilds(ctx)
 	case "teamcity://agents":
-		return h.listAgents(ctx)
-	case "teamcity://runtime":
-		return h.listRuntimeInfo(ctx)
+		return tc.ListAgents(ctx)
 	default:
 		return nil, fmt.Errorf("unsupported resource URI: %s", uri)
 	}
@@ -606,58 +687,54 @@ func (h *Handler) listResources(ctx context.Context, uri string) ([]interface{},
 
 // readResource reads a specific resource
 func (h *Handler) readResource(ctx context.Context, uri string) (interface{}, error) {
-	// Handle runtime resource separately
+	// Handle runtime resource separately - no credentials needed
 	if uri == "teamcity://runtime" {
 		return h.getRuntimeInfo(ctx)
 	}
 
+	tc, err := h.client(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	// Parse URI and delegate to appropriate handler
-	return h.tc.GetResource(ctx, uri)
+	return tc.GetResource(ctx, uri)
 }
 
 // callTool executes a tool
 func (h *Handler) callTool(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	// get_current_time is served locally, so it must work without credentials.
+	if name == "get_current_time" {
+		return h.getCurrentTime(ctx, args)
+	}
+
+	tc, err := h.client(ctx)
+	if err != nil {
+		return "", err
+	}
+
 	switch name {
 	case "trigger_build":
-		return h.tc.TriggerBuild(ctx, args)
+		return tc.TriggerBuild(ctx, args)
 	case "cancel_build":
-		return h.tc.CancelBuild(ctx, args)
+		return tc.CancelBuild(ctx, args)
 	case "pin_build":
-		return h.tc.PinBuild(ctx, args)
+		return tc.PinBuild(ctx, args)
 	case "set_build_tag":
-		return h.tc.SetBuildTag(ctx, args)
+		return tc.SetBuildTag(ctx, args)
 	case "download_artifact":
-		return h.tc.DownloadArtifact(ctx, args)
+		return tc.DownloadArtifact(ctx, args)
 	case "search_builds":
-		return h.tc.SearchBuilds(ctx, args)
+		return tc.SearchBuilds(ctx, args)
 	case "fetch_build_log":
-		return h.tc.FetchBuildLog(ctx, args)
+		return tc.FetchBuildLog(ctx, args)
 	case "search_build_configurations":
-		return h.tc.SearchBuildConfigurations(ctx, args)
-	case "get_current_time":
-		return h.getCurrentTime(ctx, args)
+		return tc.SearchBuildConfigurations(ctx, args)
 	case "get_test_results":
-		return h.tc.GetTestResults(ctx, args)
+		return tc.GetTestResults(ctx, args)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
-}
-
-// Placeholder implementations - to be expanded
-func (h *Handler) listProjects(ctx context.Context) ([]interface{}, error) {
-	return h.tc.ListProjects(ctx)
-}
-
-func (h *Handler) listBuildTypes(ctx context.Context) ([]interface{}, error) {
-	return h.tc.ListBuildTypes(ctx)
-}
-
-func (h *Handler) listBuilds(ctx context.Context) ([]interface{}, error) {
-	return h.tc.ListBuilds(ctx)
-}
-
-func (h *Handler) listAgents(ctx context.Context) ([]interface{}, error) {
-	return h.tc.ListAgents(ctx)
 }
 
 // listRuntimeInfo lists runtime information resources

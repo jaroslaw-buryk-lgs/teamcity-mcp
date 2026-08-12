@@ -13,7 +13,7 @@ GOBIN=$(GOBASE)/bin
 # Build flags
 BUILD_FLAGS=-v $(LDFLAGS)
 
-.PHONY: help build test clean docker run dev deps lint format
+.PHONY: help build test test-unit clean docker run dev deps lint format
 
 ## help: Show this help message
 help:
@@ -32,6 +32,11 @@ test:
 	@echo "Running tests..."
 	@go test -v -race -coverprofile=coverage.out ./...
 	@go tool cover -html=coverage.out -o coverage.html
+
+## test-unit: Run unit tests only (no coverage report)
+test-unit:
+	@echo "Running unit tests..."
+	@go test -race ./internal/... ./tests/unit/...
 
 ## test-integration: Run integration tests with Docker
 test-integration:

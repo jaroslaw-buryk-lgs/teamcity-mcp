@@ -2,13 +2,27 @@
 
 A comprehensive Model Context Protocol (MCP) server that exposes JetBrains TeamCity as structured AI-ready resources and tools for LLM agents and IDE plugins.
 
+## Two ways to run it
+
+| | Shared HTTP server | Local stdio |
+|---|---|---|
+| **Who holds the TeamCity token** | each user, sent per request | the process, from `TC_TOKEN` |
+| **Users per process** | many, each as themselves | one |
+| **Configure with** | `X-TeamCity-Token` header | `TC_URL` + `TC_TOKEN` env vars |
+| **Use when** | one deployment serves a team | one person runs it on their own machine |
+
+Pick the shared HTTP server if several people need access: the server holds no
+TeamCity credentials of its own, so every user acts as themselves in TeamCity,
+with their own permissions and their own audit trail. See
+[Multi-tenant HTTP deployment](#multi-tenant-http-deployment).
+
 ## Quick Start
 
 ### IDE Integration (Cursor)
 
 The TeamCity MCP server is designed to work seamlessly with AI-powered IDEs like Cursor. Here's how to configure it:
 
-#### Cursor Configuration
+#### Cursor Configuration (local stdio, single user)
 
 Add this to your Cursor MCP settings:
 
@@ -38,6 +52,128 @@ Add this to your Cursor MCP settings:
 }    
 ```
 
+#### Connecting to a shared HTTP server
+
+When someone has deployed the server for your team, you do not configure a
+TeamCity URL or spawn a process — you point at the deployment and supply your own
+TeamCity API token:
+
+```json
+{
+  "mcpServers": {
+    "teamcity": {
+      "url": "https://teamcity-mcp.your-company.com/mcp",
+      "headers": {
+        "X-TeamCity-Token": "your-own-teamcity-api-token"
+      }
+    }
+  }
+}
+```
+
+Create the token in TeamCity under **Your Profile → Access Tokens**. It is yours:
+the server never stores it, and builds you trigger are attributed to you.
+
+## Multi-tenant HTTP deployment
+
+The HTTP transport takes TeamCity credentials from the request, so one deployment
+serves any number of users with their own tokens.
+
+### Running it
+
+```bash
+export TC_URL=https://teamcity.company.com   # which TeamCity; not a secret
+./server --transport http
+```
+
+`TC_TOKEN` is **not** set. The server has no TeamCity identity of its own, and
+refuses to lend one out.
+
+### The per-request contract
+
+| Header | Required | Purpose |
+|--------|----------|---------|
+| `X-TeamCity-Token` | yes, for anything touching TeamCity | The calling user's TeamCity API token |
+| `X-TeamCity-Url` | no | Select a different TeamCity server. Must be listed in `TC_ALLOWED_URLS`, otherwise the request is refused with `400` |
+| `Authorization: Bearer <hmac>` | only if `SERVER_SECRET` is set | The optional outer gate — see [Authentication](#authentication-model) |
+
+```bash
+curl -X POST https://teamcity-mcp.your-company.com/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-TeamCity-Token: $MY_TEAMCITY_TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"resources/list","params":{"uri":"teamcity://projects"}}'
+```
+
+### Requests without a token
+
+`initialize`, `tools/list`, `ping` and `get_current_time` deliberately work with
+no credentials, so a client can connect and discover the tool list before it has
+been given a token. Anything that actually reads TeamCity returns a JSON-RPC
+error naming the header it needs:
+
+```json
+{
+  "jsonrpc": "2.0", "id": 1,
+  "error": {
+    "code": -32001,
+    "message": "TeamCity credentials required. Send the HTTP header 'X-TeamCity-Token: <your TeamCity API token>' with each request. (On the stdio transport, set the TC_URL and TC_TOKEN environment variables instead.)",
+    "data": { "tokenHeader": "X-TeamCity-Token", "urlHeader": "X-TeamCity-Url" }
+  }
+}
+```
+
+| Code | Meaning |
+|------|---------|
+| `-32001` | No TeamCity token supplied. Add the `X-TeamCity-Token` header |
+| `-32002` | The requested TeamCity URL is not permitted by this deployment |
+
+A missing TeamCity token is never a `401`. `401` means the outer `SERVER_SECRET`
+gate rejected the request, so the two conditions stay distinguishable.
+
+### Authentication model
+
+Two independent layers:
+
+1. **Outer gate (optional)** — `SERVER_SECRET` enables an HMAC check on
+   `Authorization: Bearer`. It controls who may reach the server at all. Note
+   the expected value is the *hex HMAC digest*, not the raw secret:
+   `echo -n "teamcity-mcp" | openssl dgst -sha256 -hmac "$SERVER_SECRET"`.
+2. **TeamCity credentials** — `X-TeamCity-Token`, per request, per user. This is
+   what determines what the caller can see and do in TeamCity.
+
+With `SERVER_SECRET` unset, anyone who can reach the port may use the server
+**with their own TeamCity token** — they gain no access they did not already
+have, but set it (or restrict network access) if the endpoint is public.
+
+### Security notes
+
+- **The TeamCity URL is pinned server-side.** Clients may only select a server
+  listed in `TC_URL`/`TC_ALLOWED_URLS`. Without this, `X-TeamCity-Url` would let
+  any caller make the server issue requests to arbitrary internal hosts.
+  `TC_ALLOW_ANY_URL=true` disables the pinning and should not be used in a shared
+  deployment.
+- **`TC_TOKEN` is not a fallback.** If set, it is used only for the `/readyz`
+  probe. Requests without a token fail rather than silently borrowing it. Setting
+  `TC_ALLOW_SERVER_TOKEN_FALLBACK=true` changes that and lets unauthenticated
+  callers act as whoever owns `TC_TOKEN`.
+- **Use TLS.** Tokens travel in a header on every request.
+- **Browser clients** must be allowlisted via `ALLOWED_ORIGINS` before they can
+  open a WebSocket.
+
+### Readiness
+
+`/readyz` ignores TeamCity headers entirely — it is unauthenticated, so acting on
+them would turn it into a probe for internal hosts. With no `TC_TOKEN` set there
+is nothing to probe, and it reports the TeamCity check as skipped while still
+returning `200`:
+
+```json
+{"status":"ok","checks":{"teamcity":{"status":"skipped",
+  "reason":"TC_URL/TC_TOKEN not configured; credentials are supplied per request"}}}
+```
+
+Set `TC_URL` **and** `TC_TOKEN` to restore the deep connectivity check.
+
 ## Local Development
 
 ### 1. Build the Server
@@ -50,13 +186,14 @@ make build
 ### 2. Set Environment Variables
 
 ```bash
-# Required
+# Which TeamCity to talk to. Not a secret - it pins the server clients may reach.
 export TC_URL="https://your-teamcity-server.com"
 
-# Optional (enables HMAC authentication)
+# Optional: enables the outer HMAC gate on Authorization: Bearer
 export SERVER_SECRET="your-hmac-secret-key"
 
-# Authentication
+# Only needed for --transport stdio, or to enable the /readyz deep probe.
+# On the HTTP transport, each user sends their own token per request instead.
 export TC_TOKEN="your-teamcity-api-token"
 ```
 
@@ -73,14 +210,23 @@ export TC_TOKEN="your-teamcity-api-token"
 # Health check
 curl http://localhost:8123/healthz
 
-# MCP protocol test
+# MCP protocol test - the handshake needs no TeamCity credentials
 curl -X POST http://localhost:8123/mcp \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your-hmac-secret-key" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{}}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}'
+
+# A TeamCity-backed call needs your own token
+curl -X POST http://localhost:8123/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-TeamCity-Token: $TC_TOKEN" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"resources/list","params":{"uri":"teamcity://projects"}}'
 ```
 
 **Expected result**: Health endpoint should return `{"status":"ok"}` and MCP endpoint should return initialization response.
+
+If `SERVER_SECRET` is set, every `/mcp` request also needs
+`-H "Authorization: Bearer $(echo -n teamcity-mcp | openssl dgst -sha256 -hmac "$SERVER_SECRET" -r | cut -d' ' -f1)"`
+— the HMAC digest, not the secret itself.
 
 ## Features
 
@@ -95,54 +241,70 @@ curl -X POST http://localhost:8123/mcp \
 
 ## Environment Variables Reference
 
-### Required Variables
+`./server --help` prints this same list.
+
+### Multi-tenant HTTP (recommended)
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `TC_URL` | TeamCity server URL | `https://teamcity.company.com` |
-| `SERVER_SECRET` | HMAC secret for client authentication (optional) | `my-secure-secret-123` |
+| `TC_URL` | TeamCity base URL clients connect to. Also pins which server they may reach | `https://teamcity.company.com` |
+| `TC_ALLOWED_URLS` | Comma-separated additional TeamCity URLs a client may select via `X-TeamCity-Url` | `https://tc2.company.com` |
 
-### Authentication Variables
+Each user then sends `X-TeamCity-Token: <their own token>` on every request. No
+TeamCity secret is configured on the server.
+
+### Single-tenant & stdio
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `TC_TOKEN` | TeamCity API token | `eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...` |
+| `TC_TOKEN` | TeamCity API token. **Required** for `--transport stdio`. On the HTTP transport it is used only for the `/readyz` deep probe | `eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...` |
 
-### Optional Variables
+### Security
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SERVER_SECRET` | | Enables the outer HMAC gate on `Authorization: Bearer`. Unset disables it |
+| `ALLOWED_ORIGINS` | | Comma-separated origins allowed to open a WebSocket. Requests with no `Origin` (non-browser clients) are always allowed |
+| `TC_ALLOW_SERVER_TOKEN_FALLBACK` | `false` | Let HTTP/WS requests with no token use `TC_TOKEN`. **Unsafe on a shared server** — callers act as whoever owns that token |
+| `TC_ALLOW_ANY_URL` | `false` | Disable TeamCity URL pinning. **Turns the server into an SSRF proxy — do not enable** |
+| `TLS_CERT` | | Path to TLS certificate |
+| `TLS_KEY` | | Path to TLS private key |
+
+### Optional
 
 | Variable | Default | Description | Example |
 |----------|---------|-------------|---------|
 | `LISTEN_ADDR` | `:8123` | Server listen address | `:8080` or `0.0.0.0:8123` |
 | `TC_TIMEOUT` | `30s` | TeamCity API timeout | `60s` or `2m` |
-| `TLS_CERT` | | Path to TLS certificate | `/path/to/cert.pem` |
-| `TLS_KEY` | | Path to TLS private key | `/path/to/key.pem` |
+| `TC_MAX_RESPONSE_BYTES` | `33554432` | Maximum TeamCity response read into memory (build logs are unbounded) | `67108864` |
+| `TC_MAX_IDLE_CONNS_PER_HOST` | `32` | Idle connections kept per TeamCity host | `64` |
 | `LOG_LEVEL` | `info` | Log level | `debug`, `info`, `warn`, `error` |
 | `LOG_FORMAT` | `json` | Log format | `json` or `console` |
-| `CACHE_TTL` | `10s` | Cache TTL for API responses | `30s` or `1m` |
+| `CACHE_TTL` | `10s` | Parsed but unused; see `internal/cache` | `30s` |
 
 ## Configuration Examples
+
+### Shared team server (multi-tenant)
+
+```bash
+export TC_URL=https://teamcity.company.com
+export SERVER_SECRET=$MCP_SERVER_SECRET       # optional outer gate
+export TLS_CERT=/etc/ssl/certs/teamcity-mcp.pem
+export TLS_KEY=/etc/ssl/private/teamcity-mcp.key
+export LOG_LEVEL=warn
+./server --transport http
+# No TC_TOKEN: each user sends their own via X-TeamCity-Token
+```
 
 ### Development Environment
 
 ```bash
 export TC_URL=http://localhost:8111
-export TC_TOKEN=dev-token-123
+export TC_TOKEN=dev-token-123                 # for --transport stdio and /readyz
 export SERVER_SECRET=dev-secret
 export LOG_LEVEL=debug
 export LOG_FORMAT=console
 ./server
-```
-
-### Production Environment
-
-```bash
-export TC_URL=https://teamcity.company.com
-export TC_TOKEN=$TEAMCITY_API_TOKEN
-export SERVER_SECRET=$MCP_SERVER_SECRET
-export TLS_CERT=/etc/ssl/certs/teamcity-mcp.pem
-export TLS_KEY=/etc/ssl/private/teamcity-mcp.key
-export LOG_LEVEL=warn
-export CACHE_TTL=30s
 ./server
 ```
 
@@ -154,10 +316,9 @@ export CACHE_TTL=30s
 # Build Docker image
 make docker
 
-# Run with environment variables
+# Run as a shared multi-tenant server (no TeamCity token on the server)
 docker run -p 8123:8123 \
   -e TC_URL=https://teamcity.company.com \
-  -e TC_TOKEN=your-token \
   -e SERVER_SECRET=your-secret \
   teamcity-mcp:latest
 ```
@@ -218,11 +379,8 @@ spec:
         env:
         - name: TC_URL
           value: "https://teamcity.company.com"
-        - name: TC_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: teamcity-mcp-secrets
-              key: teamcity-token
+        # No TC_TOKEN: users supply their own via the X-TeamCity-Token header,
+        # so the deployment holds no TeamCity credentials at all.
         - name: SERVER_SECRET
           valueFrom:
             secretKeyRef:
@@ -271,10 +429,8 @@ Use the included verification script to test all functionality:
 ### Manual Testing
 
 ```bash
-# 1. Set environment variables
+# 1. Set environment variables (outer gate left off for simplicity)
 export TC_URL=http://localhost:8111
-export TC_TOKEN=test-token
-export SERVER_SECRET=test-secret
 
 # 2. Start server
 ./server &
@@ -282,13 +438,18 @@ export SERVER_SECRET=test-secret
 # 3. Test health
 curl http://localhost:8123/healthz
 
-# 4. Test MCP protocol
+# 4. Test MCP protocol - the handshake needs no TeamCity credentials
 curl -X POST http://localhost:8123/mcp \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer test-secret" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{}}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}'
 
-# 5. Stop server
+# 5. Test a TeamCity-backed call with your own token
+curl -X POST http://localhost:8123/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-TeamCity-Token: your-teamcity-api-token" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"resources/list","params":{"uri":"teamcity://projects"}}'
+
+# 6. Stop server
 pkill -f teamcity-mcp
 ```
 
@@ -983,17 +1144,36 @@ The server exposes TeamCity data as MCP resources:
 
 ### Common Issues
 
-1. **Missing required environment variables**
+1. **No TeamCity server configured**
    ```
-   Error: TC_URL environment variable is required
+   Invalid configuration for -transport http: no TeamCity server is configured
    ```
-   **Solution**: Set all required environment variables
+   **Solution**: Set `TC_URL` (or `TC_ALLOWED_URLS`) so clients have a server to
+   authenticate against.
 
-2. **Authentication failures**
+2. **stdio started without credentials**
    ```
-   Error: TC_TOKEN environment variable is required
+   Invalid configuration for -transport stdio: TC_TOKEN is required for the stdio transport
    ```
-   **Solution**: Set `TC_TOKEN` with your TeamCity API token
+   **Solution**: stdio has no HTTP headers, so it needs `TC_URL` and `TC_TOKEN`.
+   To supply credentials per user instead, use `--transport http`.
+
+3. **`-32001 TeamCity credentials required`**
+
+   The request reached the server but carried no token. Add
+   `X-TeamCity-Token: <your TeamCity API token>` to your client's header
+   configuration. `initialize` and `tools/list` succeeding without it is expected.
+
+4. **`400 TeamCity URL is not allowed by server policy`**
+
+   Your `X-TeamCity-Url` header names a server this deployment does not permit.
+   Drop the header to use the server's own `TC_URL`, or ask the operator to add
+   yours to `TC_ALLOWED_URLS`.
+
+5. **`TeamCity rejected the supplied token (HTTP 401)`**
+
+   Your token is wrong, expired, or lacks the necessary permissions. Regenerate
+   it in TeamCity under **Your Profile → Access Tokens**.
 
 3. **Invalid timeout format**
    ```

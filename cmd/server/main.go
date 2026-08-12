@@ -9,10 +9,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"go.uber.org/zap"
+
 	"github.com/itcaat/teamcity-mcp/internal/config"
 	"github.com/itcaat/teamcity-mcp/internal/logging"
 	"github.com/itcaat/teamcity-mcp/internal/metrics"
 	"github.com/itcaat/teamcity-mcp/internal/server"
+	"github.com/itcaat/teamcity-mcp/internal/teamcity"
 )
 
 var (
@@ -64,12 +67,21 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
+	// Requirements differ per transport: stdio needs TC_URL and TC_TOKEN, while
+	// http only needs a permitted TeamCity server for clients to authenticate
+	// against. Failing here beats a server that rejects every request.
+	if err := cfg.ValidateForTransport(*transport); err != nil {
+		log.Fatalf("Invalid configuration for -transport %s: %v", *transport, err)
+	}
+
 	// Initialize logging
 	logger, err := logging.New(cfg.Logging)
 	if err != nil {
 		log.Fatalf("Failed to initialize logging: %v", err)
 	}
 	defer logger.Sync()
+
+	warnUnsafeConfig(logger, cfg, *transport)
 
 	// Initialize metrics
 	metrics.Init()
@@ -105,15 +117,41 @@ func main() {
 	}()
 
 	// Start server
-	logger.Info("Starting TeamCity MCP server",
+	fields := []interface{}{
+		"Starting TeamCity MCP server",
 		"version", version,
 		"commit", commit,
 		"transport", *transport,
-		"teamcity_url", cfg.TeamCity.URL)
+	}
+	if cfg.TeamCity.URL != "" {
+		fields = append(fields, "teamcity_url", cfg.TeamCity.URL)
+	}
+	logger.Info(fields...)
 
 	if err := srv.Start(ctx, *transport); err != nil {
 		logger.Fatal("Server failed", "error", err)
 	}
 
 	logger.Info("Server shutdown complete")
+}
+
+// warnUnsafeConfig flags settings that are dangerous in a shared deployment.
+func warnUnsafeConfig(logger *zap.SugaredLogger, cfg *config.Config, transport string) {
+	if transport != "http" {
+		return
+	}
+
+	if cfg.TeamCity.AllowAnyURL {
+		logger.Warn("TC_ALLOW_ANY_URL is enabled: any client can make this server issue requests to arbitrary hosts. Do not use this in a shared deployment")
+	}
+	if cfg.TeamCity.AllowServerToken {
+		logger.Warn("TC_ALLOW_SERVER_TOKEN_FALLBACK is enabled: requests without an " +
+			teamcity.HeaderToken + " header will act as the identity that owns TC_TOKEN")
+	}
+	if cfg.TeamCity.Token != "" && !cfg.TeamCity.AllowServerToken {
+		logger.Info("TC_TOKEN is set but only used for the /readyz probe; clients must send their own " + teamcity.HeaderToken + " header")
+	}
+	if cfg.Server.ServerSecret == "" {
+		logger.Info("SERVER_SECRET is not set, so the outer authentication gate is disabled; anyone who can reach this port may use it with their own TeamCity token")
+	}
 }

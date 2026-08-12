@@ -59,5 +59,9 @@ temp/
 testdata/output/
 
 # Cache directories
-.cache/ 
-server
+.cache/
+
+# The convenience binary/symlink that `make build` drops at the repo root.
+# Anchored with a leading slash: a bare "server" also matched the
+# internal/server/ package directory, silently excluding new files there.
+/server
