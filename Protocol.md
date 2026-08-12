@@ -630,26 +630,67 @@ Fetch with regex pattern filter:
 
 ## Authentication
 
-### Client to MCP Server
+Two independent layers. They use different headers so their failures never look
+alike: a `401` always means the outer gate rejected the request, and never that a
+TeamCity token was missing.
 
-Uses HMAC-SHA256 signed Bearer tokens:
+### Layer 1: Outer gate (optional) — who may reach the server
+
+Enabled only when `SERVER_SECRET` is configured. Uses an HMAC-SHA256 derived
+Bearer token:
 
 ```http
 Authorization: Bearer <hmac_token>
 ```
 
-The token is generated using:
+The token is the hex digest of:
 ```
 HMAC-SHA256(message="teamcity-mcp", secret=server_secret)
 ```
 
-### MCP Server to TeamCity
+Note this is the *digest*, not the raw secret. Failure is `401 Unauthorized`.
+`/healthz`, `/readyz` and `/metrics` are exempt (matched as exact paths).
 
-Uses TeamCity API token authentication:
+### Layer 2: TeamCity credentials — who the caller is in TeamCity
+
+On the **HTTP and WebSocket** transports these are supplied per request, so one
+deployment serves many users under their own identities:
 
 ```http
-Authorization: Bearer <teamcity_api_token>
+X-TeamCity-Token: <the calling user's TeamCity API token>
+X-TeamCity-Url:   <optional; must be permitted by server policy>
 ```
+
+The server holds no TeamCity identity of its own. It mints a short-lived client
+per request and forwards the caller's token to TeamCity as
+`Authorization: Bearer <teamcity_api_token>`.
+
+`X-TeamCity-Url` is matched against `TC_URL` ∪ `TC_ALLOWED_URLS` after
+normalization (lowercased scheme/host, trailing slash stripped; userinfo, query
+and fragment rejected). A URL outside that set is refused with `400 Bad Request`
+before the JSON-RPC layer is reached — without pinning, this header would let any
+caller drive requests to arbitrary hosts reachable from the server.
+
+On the **stdio** transport there are no headers, so credentials come from the
+`TC_URL` and `TC_TOKEN` environment variables and are bound for the process
+lifetime.
+
+**WebSocket:** headers exist only during the upgrade handshake, so credentials are
+captured at that point and bound to the connection for its whole lifetime. Every
+frame on a connection therefore uses the token presented at upgrade time.
+
+### Methods that need no credentials
+
+These must work before a client has been given a token, so it can connect and
+discover what is available:
+
+- `initialize`, `initialized`, `ping`
+- `tools/list`
+- `tools/call` with `get_current_time`
+- `resources/list` with no URI, and `resources/list` / `resources/read` for
+  `teamcity://runtime`
+
+Everything else resolves credentials and fails with `-32001` if there are none.
 
 ## Error Handling
 
@@ -673,6 +714,39 @@ The server follows JSON-RPC 2.0 error response format:
 - `-32601`: Method not found
 - `-32602`: Invalid params
 - `-32603`: Internal error (TeamCity API error)
+
+**Credential Error Codes** (implementation-defined range):
+- `-32001`: TeamCity credentials required. The request carried no
+  `X-TeamCity-Token` header (and no `TC_TOKEN` on stdio). The `message` contains
+  the full instruction — clients that surface only `error.message` still show
+  something actionable — and `data` carries `tokenHeader` / `urlHeader`.
+- `-32002`: The requested TeamCity URL is not permitted by server policy. Normally
+  seen only if the client bypasses `/mcp`'s middleware, which rejects a disallowed
+  `X-TeamCity-Url` with `400` first.
+
+A missing TeamCity token is deliberately **not** `-32603` (which reads as a server
+bug and prompts retries), **not** `-32602` (the params were fine; the headers were
+not), and **not** `401` (reserved for the outer `SERVER_SECRET` gate).
+
+Example:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32001,
+    "message": "TeamCity credentials required. Send the HTTP header 'X-TeamCity-Token: <your TeamCity API token>' with each request. (On the stdio transport, set the TC_URL and TC_TOKEN environment variables instead.)",
+    "data": {
+      "tokenHeader": "X-TeamCity-Token",
+      "urlHeader": "X-TeamCity-Url"
+    }
+  }
+}
+```
+
+TeamCity authentication failures are reported as `-32603` with a message stating
+that TeamCity rejected the token; the token itself is never echoed back.
 
 ## Rate Limiting
 

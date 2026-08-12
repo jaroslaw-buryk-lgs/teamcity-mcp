@@ -41,9 +41,16 @@ services:
     ports:
       - "8123:8123"
     environment:
-      - TC_URL=http://teamcity:8111
-      - TC_TOKEN=your-teamcity-token
-      # - SERVER_SECRET=your-server-secret  # Optional - enables HMAC auth
+      # Which TeamCity clients reach. Not a secret, and it pins the only server
+      # a client may select. (Was http://teamcity:8111, which does not resolve -
+      # the service is named teamcity-server.)
+      - TC_URL=http://teamcity-server:8111
+      # No TC_TOKEN: each user sends their own token per request as
+      #   X-TeamCity-Token: <their TeamCity API token>
+      # Set it only for --transport stdio, or to enable the /readyz deep probe.
+      # - TC_TOKEN=your-teamcity-token
+      # - TC_ALLOWED_URLS=http://tc2:8111  # extra servers a client may select
+      # - SERVER_SECRET=your-server-secret  # Optional - enables the outer HMAC gate
       - LOG_LEVEL=info
       - LOG_FORMAT=json
       - CACHE_TTL=10s

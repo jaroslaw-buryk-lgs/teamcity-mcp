@@ -11,7 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
-	"github.com/itcaat/teamcity-mcp/internal/cache"
 	"github.com/itcaat/teamcity-mcp/internal/config"
 	"github.com/itcaat/teamcity-mcp/internal/mcp"
 	"github.com/itcaat/teamcity-mcp/internal/teamcity"
@@ -21,12 +20,8 @@ func TestRuntimeFunctionality(t *testing.T) {
 	// Create logger
 	logger := zaptest.NewLogger(t).Sugar()
 
-	// Create cache
-	cacheConfig := config.CacheConfig{TTL: "10s"}
-	cache, err := cache.New(cacheConfig)
-	require.NoError(t, err)
-
-	// Create TeamCity client (mock is fine for this test)
+	// Create TeamCity client (mock is fine for this test). A single *Client is
+	// itself a ClientResolver, which is how the stdio transport works.
 	tcConfig := config.TeamCityConfig{
 		URL:     "http://localhost:8111",
 		Token:   "test-token",
@@ -36,7 +31,7 @@ func TestRuntimeFunctionality(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create handler
-	handler := mcp.NewHandler(tc, cache, logger)
+	handler := mcp.NewHandler(tc, logger)
 
 	t.Run("initialize includes current time", func(t *testing.T) {
 		resp, err := handler.HandleRequest(context.Background(), json.RawMessage(`{

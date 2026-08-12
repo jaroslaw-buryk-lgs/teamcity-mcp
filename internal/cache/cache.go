@@ -1,3 +1,15 @@
+// Package cache provides in-memory caching with a TTL.
+//
+// NOT WIRED UP. It was previously constructed and injected into the MCP handler
+// but never read. It is deliberately left unconnected because TeamCity
+// credentials are now per request, which makes a shared cache a cross-tenant
+// data leak: a key like "projects" populated by one user would be served to
+// every other user, regardless of what their TeamCity permissions allow.
+//
+// Before reconnecting this, namespace every key by
+// teamcity.Credentials.Fingerprint() so entries can never be shared between
+// callers - ideally by exposing only a per-tenant handle, so an unnamespaced key
+// is not expressible.
 package cache
 
 import (

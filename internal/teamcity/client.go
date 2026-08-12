@@ -18,12 +18,16 @@ import (
 	"github.com/itcaat/teamcity-mcp/internal/metrics"
 )
 
-// Client wraps the TeamCity REST API client
+// Client wraps the TeamCity REST API client for a single set of credentials.
+//
+// A Client is request-scoped in the multi-tenant HTTP case: it holds one user's
+// token and borrows the process-wide httpClient. It is safe for concurrent use.
 type Client struct {
 	httpClient *http.Client
 	baseURL    string
+	token      string
+	maxBytes   int64
 	logger     *zap.SugaredLogger
-	cfg        config.TeamCityConfig
 }
 
 // Project represents a TeamCity project
@@ -112,49 +116,81 @@ type TestOccurrence struct {
 	Muted    bool   `json:"muted,omitempty"`
 }
 
-// NewClient creates a new TeamCity client
+// NewClient creates a single-tenant TeamCity client from static configuration.
+// Used by the stdio transport and by tests; the HTTP transport goes through
+// Provider instead so that every tenant shares one transport.
 func NewClient(cfg config.TeamCityConfig, logger *zap.SugaredLogger) (*Client, error) {
-	timeout, err := time.ParseDuration(cfg.Timeout)
+	policy, err := NewPolicy(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("invalid timeout: %w", err)
+		return nil, err
 	}
 
-	httpClient := &http.Client{
-		Timeout: timeout,
+	httpClient, err := newHTTPClient(cfg, policy.CheckRedirect)
+	if err != nil {
+		return nil, err
 	}
 
 	return &Client{
 		httpClient: httpClient,
-		baseURL:    cfg.URL,
+		baseURL:    policy.DefaultURL,
+		token:      cfg.Token,
+		maxBytes:   maxBytesOrDefault(cfg.MaxResponseBytes),
 		logger:     logger,
-		cfg:        cfg,
 	}, nil
 }
 
-// makeRequest makes an authenticated HTTP request to TeamCity
-func (c *Client) makeRequest(ctx context.Context, method, endpoint string, body []byte) ([]byte, error) {
-	url := c.baseURL + "/app/rest" + endpoint
+// ClientForContext lets a single Client act as a degenerate single-tenant
+// resolver, so stdio and tests share the multi-tenant code path in mcp.Handler.
+func (c *Client) ClientForContext(context.Context) (*Client, error) { return c, nil }
 
+// newRequest builds an authenticated request against an absolute TeamCity URL.
+// Every outbound request must go through here - this is the only place the
+// token is attached.
+func (c *Client) newRequest(ctx context.Context, method, rawURL string, body []byte) (*http.Request, error) {
 	var reqBody io.Reader
 	if body != nil {
 		reqBody = bytes.NewReader(body)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 
-	// Set authentication
-	if c.cfg.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
-
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
-
-	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+
+	return req, nil
+}
+
+// readBody reads a response body, refusing to buffer more than maxBytes.
+// Build logs are unbounded, so an uncapped read is an easy way to OOM a shared server.
+func (c *Client) readBody(resp *http.Response) ([]byte, error) {
+	limit := maxBytesOrDefault(c.maxBytes)
+
+	// Read one extra byte so a body exactly at the limit is distinguishable from
+	// one that was truncated.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("TeamCity response exceeded the %d byte limit (set TC_MAX_RESPONSE_BYTES to raise it)", limit)
+	}
+	return body, nil
+}
+
+// makeRequest makes an authenticated request to the TeamCity REST API.
+func (c *Client) makeRequest(ctx context.Context, method, endpoint string, body []byte) ([]byte, error) {
+	req, err := c.newRequest(ctx, method, c.baseURL+"/app/rest"+endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -162,16 +198,28 @@ func (c *Client) makeRequest(ctx context.Context, method, endpoint string, body 
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := c.readBody(resp)
 	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
+		return nil, err
 	}
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+		return nil, apiError(resp.StatusCode, respBody)
 	}
 
 	return respBody, nil
+}
+
+// apiError turns a TeamCity error response into an error. Authentication
+// failures get an explicit message, since with per-request tokens they are the
+// most likely failure and the raw TeamCity body rarely says anything useful.
+func apiError(statusCode int, body []byte) error {
+	switch statusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return fmt.Errorf("TeamCity rejected the supplied token (HTTP %d): check that your TeamCity API token is valid and has the required permissions", statusCode)
+	default:
+		return fmt.Errorf("API error %d: %s", statusCode, string(body))
+	}
 }
 
 // GetResource gets a resource by URI
@@ -859,16 +907,9 @@ func (c *Client) FetchBuildLog(ctx context.Context, args json.RawMessage) (strin
 	}
 
 	// Make the request using the custom endpoint (not REST API)
-	url := c.baseURL + endpoint
-
-	reqObj, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	reqObj, err := c.newRequest(ctx, "GET", c.baseURL+endpoint, nil)
 	if err != nil {
-		return "", fmt.Errorf("creating request: %w", err)
-	}
-
-	// Set authentication
-	if c.cfg.Token != "" {
-		reqObj.Header.Set("Authorization", "Bearer "+c.cfg.Token)
+		return "", err
 	}
 
 	resp, err := c.httpClient.Do(reqObj)
@@ -877,15 +918,14 @@ func (c *Client) FetchBuildLog(ctx context.Context, args json.RawMessage) (strin
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	// Read the body first so the size cap applies to error responses too.
+	respBody, err := c.readBody(resp)
+	if err != nil {
+		return "", err
 	}
 
-	// Read the response body
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("reading response: %w", err)
+	if resp.StatusCode >= 400 {
+		return "", apiError(resp.StatusCode, respBody)
 	}
 
 	// If archived, we get binary data - indicate this in the response

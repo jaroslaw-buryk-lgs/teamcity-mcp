@@ -13,11 +13,18 @@ import (
 
 // Checker provides health check functionality
 type Checker struct {
+	// tc is the operator-configured TeamCity client, or nil when TC_URL/TC_TOKEN
+	// are unset because credentials are supplied per request.
+	//
+	// The checker never reads credentials from the request: /readyz is
+	// unauthenticated, so honouring client-supplied headers here would turn it
+	// into an SSRF probe with a success oracle.
 	tc     *teamcity.Client
 	logger *zap.SugaredLogger
 }
 
-// New creates a new health checker
+// New creates a new health checker. tc may be nil, in which case the TeamCity
+// connectivity check is reported as skipped rather than failing.
 func New(tc *teamcity.Client, logger *zap.SugaredLogger) *Checker {
 	return &Checker{
 		tc:     tc,
@@ -49,17 +56,29 @@ func (h *Checker) ReadinessHandler(w http.ResponseWriter, r *http.Request) {
 	statusCode := http.StatusOK
 	checks := make(map[string]interface{})
 
-	// Check TeamCity connectivity
-	if err := h.checkTeamCity(ctx); err != nil {
-		status = "error"
-		statusCode = http.StatusServiceUnavailable
+	// Check TeamCity connectivity.
+	//
+	// With no server-side credentials there is nothing to probe, and the process
+	// is still ready to serve multi-tenant traffic - so this stays a 200. A nil
+	// check here is mandatory, not cosmetic: ListProjects on a nil client panics.
+	switch {
+	case h.tc == nil:
 		checks["teamcity"] = map[string]interface{}{
-			"status": "error",
-			"error":  err.Error(),
+			"status": "skipped",
+			"reason": "TC_URL/TC_TOKEN not configured; credentials are supplied per request",
 		}
-	} else {
-		checks["teamcity"] = map[string]interface{}{
-			"status": "ok",
+	default:
+		if err := h.checkTeamCity(ctx); err != nil {
+			status = "error"
+			statusCode = http.StatusServiceUnavailable
+			checks["teamcity"] = map[string]interface{}{
+				"status": "error",
+				"error":  err.Error(),
+			}
+		} else {
+			checks["teamcity"] = map[string]interface{}{
+				"status": "ok",
+			}
 		}
 	}
 
