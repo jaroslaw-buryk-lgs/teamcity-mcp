@@ -13,7 +13,8 @@ GOBIN=$(GOBASE)/bin
 # Build flags
 BUILD_FLAGS=-v $(LDFLAGS)
 
-.PHONY: help build test test-unit clean docker run dev deps lint format
+.PHONY: help build test test-unit clean docker run dev deps lint format \
+        install-service uninstall-service service-status service-logs
 
 ## help: Show this help message
 help:
@@ -93,6 +94,24 @@ run: build
 run-stdio: build
 	@echo "Running $(BINARY_NAME) in STDIO mode..."
 	@$(GOBIN)/$(BINARY_NAME) -transport stdio
+
+## install-service: Install as a systemd service that starts at boot (needs sudo)
+install-service: build
+	@sudo ./scripts/install-service.sh
+
+## uninstall-service: Remove the systemd service (needs sudo)
+uninstall-service:
+	@sudo ./scripts/uninstall-service.sh
+
+## service-status: Show service status and recent logs
+service-status:
+	@systemctl --no-pager --full status teamcity-mcp || true
+	@echo ""
+	@sudo journalctl -u teamcity-mcp -n 20 --no-pager || true
+
+## service-logs: Follow the service logs
+service-logs:
+	@sudo journalctl -u teamcity-mcp -f
 
 ## dev: Run in development mode with hot reload
 dev:

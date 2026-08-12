@@ -1,0 +1,81 @@
+[Unit]
+Description=TeamCity MCP Server (multi-tenant HTTP)
+Documentation=https://github.com/itcaat/teamcity-mcp
+# The server binds a TCP port at startup, so wait for real connectivity rather
+# than just for the network stack to exist.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/teamcity-mcp -transport http
+
+# The server reloads its configuration on SIGHUP: the TeamCity policy (TC_URL,
+# TC_ALLOWED_URLS) is rebuilt without dropping connections. Changing
+# LISTEN_ADDR or the TLS paths still needs a full restart.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Configuration lives here so no secret is stored in this unit file.
+# systemd reads it as root before dropping privileges, so it can stay 0600
+# root-owned and remain unreadable by the service itself.
+EnvironmentFile=/etc/teamcity-mcp/teamcity-mcp.env
+
+Restart=always
+RestartSec=2s
+# Do not give up permanently if TeamCity or DNS is unavailable for a while.
+StartLimitBurst=0
+
+# Logs go to the journal: journalctl -u teamcity-mcp -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=teamcity-mcp
+
+# --- Isolation -------------------------------------------------------------
+# DynamicUser gives the service a transient, unprivileged UID with no home,
+# no shell and no login. The process is stateless - it owns no files and holds
+# no TeamCity credentials of its own - so there is nothing that needs a stable
+# owner. Callers supply their own token per request.
+DynamicUser=yes
+
+# The port is above 1024, so no capabilities are required at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+# Only IP networking - no unix sockets to other services, no netlink.
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0077
+
+# --- Resource limits -------------------------------------------------------
+# One shared HTTP transport plus per-request clients; the default 1024 is
+# plenty, but be explicit so a descriptor leak fails loudly instead of
+# exhausting the host.
+LimitNOFILE=8192
+# Responses are capped by TC_MAX_RESPONSE_BYTES (32 MiB default), so a hard
+# memory ceiling catches anything pathological without tripping in normal use.
+MemoryMax=512M
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target
