@@ -15,6 +15,20 @@
 set -euo pipefail
 
 CA_SRC="/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt"
+
+case "${1:-}" in
+    -h|--help)
+        sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+    -*)
+        # Without this, a mistyped flag is taken as the output path and the
+        # certificate is written to a file literally named "--help".
+        echo "error: unknown option '$1' (the only argument is an output path)" >&2
+        exit 1
+        ;;
+esac
+
 DEST="${1:-./caddy-root.crt}"
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
