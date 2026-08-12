@@ -14,7 +14,8 @@ GOBIN=$(GOBASE)/bin
 BUILD_FLAGS=-v $(LDFLAGS)
 
 .PHONY: help build test test-unit clean docker run dev deps lint format \
-        install-service uninstall-service service-status service-logs
+        install-service uninstall-service service-status service-logs \
+        install-caddy export-ca
 
 ## help: Show this help message
 help:
@@ -102,6 +103,14 @@ install-service: build
 ## uninstall-service: Remove the systemd service (needs sudo)
 uninstall-service:
 	@sudo ./scripts/uninstall-service.sh
+
+## install-caddy: Install Caddy as the HTTPS terminator for this host (needs sudo)
+install-caddy:
+	@sudo ./scripts/install-caddy.sh
+
+## export-ca: Export Caddy's internal CA root for client machines to trust
+export-ca:
+	@./scripts/export-ca.sh
 
 ## service-status: Show service status and recent logs
 service-status:
